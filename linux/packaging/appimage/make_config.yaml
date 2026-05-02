@@ -1,0 +1,8 @@
+display_name: "Sealed App"
+icon: "linux/packaging/appimage/icon.png"
+generic_name: "Sealed App"
+categories:
+  - Utility
+keywords: []
+startup_notify: true
+include: []
