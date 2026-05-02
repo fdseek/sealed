@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +9,8 @@ import 'package:sealed_app/services/fingerprint_service.dart';
 import 'package:sealed_app/services/lock_gate.dart';
 import 'package:sealed_app/services/lock_settings_screen.dart';
 import 'package:sealed_app/services/share_screen_service.dart';
+import 'package:sealed_app/services/word_encoder.dart';
+import 'package:sealed_app/services/word_encoder_settings_screen.dart';
 import 'db/database_helper.dart';
 import 'models/user_model.dart';
 import 'models/contact_model.dart';
@@ -159,8 +163,7 @@ class _AppNavigationState extends State<AppNavigation> {
               ),
             ),
             const SizedBox(height: 16),
-            Text('Add Contact',
-                style: Theme.of(context).textTheme.titleMedium),
+            Text('Add Contact', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             if (_cameraSupported)
               ListTile(
@@ -196,17 +199,18 @@ class _AppNavigationState extends State<AppNavigation> {
 
   // ─── QR Scanner ──────────────────────────────────────
 
-void _openQrScanner() {
-  Navigator.push(
-    context,
-    MaterialPageRoute(builder: (_) => _QrScannerPage(
-      onDetected: (payload) async {
-        Navigator.pop(context);
-        await _showConfirmAddContact(payload);
-      },
-    )),
-  );
-}
+  void _openQrScanner() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+          builder: (_) => _QrScannerPage(
+                onDetected: (payload) async {
+                  Navigator.pop(context);
+                  await _showConfirmAddContact(payload);
+                },
+              )),
+    );
+  }
   // ─── Paste ───────────────────────────────────────────
 
   Future<void> _pasteAndAdd() async {
@@ -257,8 +261,7 @@ void _openQrScanner() {
                 ),
               ),
               const SizedBox(height: 12),
-              _KeyPreview(
-                  label: 'Encryption Key', value: payload.encPublicKey),
+              _KeyPreview(label: 'Encryption Key', value: payload.encPublicKey),
               const SizedBox(height: 8),
               _KeyPreview(label: 'Signing Key', value: payload.sigPublicKey),
             ],
@@ -292,8 +295,8 @@ void _openQrScanner() {
         }
       } catch (e) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Failed: ${e.toString()}')));
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text('Failed: ${e.toString()}')));
         }
       }
     }
@@ -513,7 +516,11 @@ void _openQrScanner() {
           _selectedContact!.publicKey,
           signingPrivateKey,
         );
-        setState(() => _result = encrypted);
+// convert base64 → words
+        final mode = await WordEncoderService.loadMode();
+        final bytes = base64Url.decode(encrypted);
+        final words = WordEncoderService.encode(bytes, mode);
+        setState(() => _result = words);
       } else {
         if (_selectedContact == null) {
           setState(() =>
@@ -525,8 +532,12 @@ void _openQrScanner() {
           setState(() => _errorMessage = 'No private key found. Reset keys.');
           return;
         }
+        final mode = await WordEncoderService.loadMode();
+        final bytes = WordEncoderService.decode(input, mode);
+        final b64 = base64Url.encode(bytes);
+
         final decryptResult = await CryptoService.decryptAndVerify(
-          input,
+          b64, // ← use b64 not input
           privateKey,
           _selectedContact!.signingPublicKey,
         );
@@ -619,8 +630,7 @@ void _openQrScanner() {
                     children: [
                       Expanded(
                         child: FilledButton.icon(
-                          onPressed: () =>
-                              setState(() => currentPageIndex = 2),
+                          onPressed: () => setState(() => currentPageIndex = 2),
                           icon: const Icon(Icons.qr_code_2, size: 16),
                           label: const Text('Share QR'),
                         ),
@@ -639,9 +649,7 @@ void _openQrScanner() {
               ),
             ),
           ),
-
           const SizedBox(height: 24),
-
           Text('Mode', style: theme.textTheme.labelLarge),
           const SizedBox(height: 6),
           SegmentedButton<bool>(
@@ -667,9 +675,7 @@ void _openQrScanner() {
               _selectedContact = null;
             }),
           ),
-
           const SizedBox(height: 20),
-
           Text(
             _isEncrypt ? 'Recipient' : 'Sender (for signature verification)',
             style: theme.textTheme.labelLarge,
@@ -691,7 +697,6 @@ void _openQrScanner() {
             onChanged: (val) => setState(() => _selectedContact = val),
           ),
           const SizedBox(height: 20),
-
           Text('Input', style: theme.textTheme.labelLarge),
           const SizedBox(height: 6),
           TextField(
@@ -704,9 +709,7 @@ void _openQrScanner() {
                   : 'Paste encrypted message...',
             ),
           ),
-
           const SizedBox(height: 12),
-
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
@@ -722,7 +725,6 @@ void _openQrScanner() {
               label: Text(_isEncrypt ? 'Encrypt & Sign' : 'Decrypt & Verify'),
             ),
           ),
-
           if (_errorMessage != null) ...[
             const SizedBox(height: 12),
             Container(
@@ -748,7 +750,6 @@ void _openQrScanner() {
               ),
             ),
           ],
-
           if (!_isEncrypt && _lastSigValid != null) ...[
             const SizedBox(height: 12),
             Container(
@@ -792,7 +793,6 @@ void _openQrScanner() {
               ),
             ),
           ],
-
           if (_result.isNotEmpty) ...[
             const SizedBox(height: 20),
             Row(
@@ -885,8 +885,7 @@ void _openQrScanner() {
                     child: const Text('Cancel'),
                   ),
                   FilledButton(
-                    style:
-                        FilledButton.styleFrom(backgroundColor: Colors.red),
+                    style: FilledButton.styleFrom(backgroundColor: Colors.red),
                     onPressed: () {
                       confirmed = true;
                       Navigator.pop(ctx);
@@ -953,6 +952,15 @@ void _openQrScanner() {
     return Scaffold(
       appBar: AppBar(
         actions: [
+          IconButton(
+            // ← ADD translate here
+            icon: const Icon(Icons.translate),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => const WordEncoderSettingsScreen()),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.security),
             onPressed: () => Navigator.push(
