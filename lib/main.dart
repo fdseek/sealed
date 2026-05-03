@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:sealed_app/services/fingerprint_service.dart';
 import 'package:sealed_app/services/lock_gate.dart';
 import 'package:sealed_app/services/lock_settings_screen.dart';
 import 'package:sealed_app/services/share_screen_service.dart';
+import 'package:sealed_app/services/word_encoder.dart';
 import 'db/database_helper.dart';
 import 'models/user_model.dart';
 import 'models/contact_model.dart';
@@ -14,7 +16,6 @@ import 'repositories/user_repository.dart';
 import 'repositories/contact_repository.dart';
 import 'services/deep_link_service.dart';
 
-/// Camera scanning only supported on Android / iOS.
 bool get _cameraSupported =>
     defaultTargetPlatform == TargetPlatform.android ||
     defaultTargetPlatform == TargetPlatform.iOS;
@@ -31,9 +32,7 @@ class NavigationBarApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      home: LockGate(
-        child: const AppNavigation(),
-      ),
+      home: LockGate(child: const AppNavigation()),
     );
   }
 }
@@ -64,6 +63,10 @@ class _AppNavigationState extends State<AppNavigation> {
   bool _processing = false;
   bool? _lastSigValid;
 
+  // encoding state — default Base64
+  bool _useBase64 = true;
+  TokenMode _tokenMode = TokenMode.persian;
+
   @override
   void initState() {
     super.initState();
@@ -74,16 +77,16 @@ class _AppNavigationState extends State<AppNavigation> {
     var user = await _userRepo.getUser();
     user ??= await _userRepo.generateAndSave();
     final contacts = await _contactRepo.getAll();
+    final savedMode = await WordEncoderService.loadMode();
     setState(() {
       _user = user;
       _contacts = contacts;
+      _tokenMode = savedMode;
       _loading = false;
     });
-    // check clipboard on startup for valid contact link
     _checkClipboardForContact();
   }
 
-  /// On open: sniff clipboard → prompt if valid sealed:// link found
   Future<void> _checkClipboardForContact() async {
     try {
       final data = await Clipboard.getData('text/plain');
@@ -94,11 +97,24 @@ class _AppNavigationState extends State<AppNavigation> {
       final payload = DeepLinkService.parse(linkMatch);
       if (payload == null) return;
       if (!mounted) return;
-      // small delay so UI settles
       await Future.delayed(const Duration(milliseconds: 600));
       if (!mounted) return;
       await _showConfirmAddContact(payload);
     } catch (_) {}
+  }
+
+  // ─── Encoding helpers ─────────────────────────────────
+
+  String _encodeOutput(String base64Cipher) {
+    if (_useBase64) return base64Cipher;
+    final bytes = Uint8List.fromList(base64Url.decode(base64Cipher));
+    return WordEncoderService.encode(bytes, _tokenMode);
+  }
+
+  String _decodeInput(String input) {
+    if (_useBase64) return input;
+    final bytes = WordEncoderService.decode(input, _tokenMode);
+    return base64Url.encode(bytes);
   }
 
   // ─── Key actions ─────────────────────────────────────
@@ -139,9 +155,8 @@ class _AppNavigationState extends State<AppNavigation> {
     }
   }
 
-  // ─── Add Contact entry point ─────────────────────────
+  // ─── Add Contact ──────────────────────────────────────
 
-  /// FAB → bottom sheet with 3 options
   void _openAddContactSheet() {
     showModalBottomSheet(
       context: context,
@@ -194,29 +209,26 @@ class _AppNavigationState extends State<AppNavigation> {
     );
   }
 
-  // ─── QR Scanner ──────────────────────────────────────
-
-void _openQrScanner() {
-  Navigator.push(
-    context,
-    MaterialPageRoute(builder: (_) => _QrScannerPage(
-      onDetected: (payload) async {
-        Navigator.pop(context);
-        await _showConfirmAddContact(payload);
-      },
-    )),
-  );
-}
-  // ─── Paste ───────────────────────────────────────────
+  void _openQrScanner() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+          builder: (_) => _QrScannerPage(
+                onDetected: (payload) async {
+                  Navigator.pop(context);
+                  await _showConfirmAddContact(payload);
+                },
+              )),
+    );
+  }
 
   Future<void> _pasteAndAdd() async {
     final data = await Clipboard.getData('text/plain');
     if (!mounted) return;
     final text = data?.text ?? '';
     if (text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Clipboard is empty')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Clipboard is empty')));
       return;
     }
     final linkMatch =
@@ -225,14 +237,11 @@ void _openQrScanner() {
     if (payload == null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No valid Sealed link found')),
-      );
+          const SnackBar(content: Text('No valid Sealed link found')));
       return;
     }
     await _showConfirmAddContact(payload);
   }
-
-  // ─── Confirm add contact dialog ───────────────────────
 
   Future<void> _showConfirmAddContact(ContactPayload payload) async {
     final nameCtrl =
@@ -252,9 +261,7 @@ void _openQrScanner() {
               TextField(
                 controller: nameCtrl,
                 decoration: const InputDecoration(
-                  labelText: 'Name',
-                  border: OutlineInputBorder(),
-                ),
+                    labelText: 'Name', border: OutlineInputBorder()),
               ),
               const SizedBox(height: 12),
               _KeyPreview(
@@ -266,13 +273,11 @@ void _openQrScanner() {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Add Contact'),
-          ),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Add Contact')),
         ],
       ),
     );
@@ -288,7 +293,7 @@ void _openQrScanner() {
         if (mounted) {
           ScaffoldMessenger.of(context)
               .showSnackBar(SnackBar(content: Text('$name added')));
-          setState(() => currentPageIndex = 1); // jump to contacts tab
+          setState(() => currentPageIndex = 1);
         }
       } catch (e) {
         if (mounted) {
@@ -299,14 +304,11 @@ void _openQrScanner() {
     }
   }
 
-  // ─── Manual add contact dialog ────────────────────────
-
   Future<void> _showAddContactDialog({ContactModel? prefill}) async {
     final nameCtrl = TextEditingController(text: prefill?.name ?? '');
     final encKeyCtrl = TextEditingController(text: prefill?.publicKey ?? '');
     final sigKeyCtrl =
         TextEditingController(text: prefill?.signingPublicKey ?? '');
-
     await showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -316,12 +318,9 @@ void _openQrScanner() {
             mainAxisSize: MainAxisSize.min,
             children: [
               TextField(
-                controller: nameCtrl,
-                decoration: const InputDecoration(
-                  labelText: 'Name',
-                  border: OutlineInputBorder(),
-                ),
-              ),
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(
+                      labelText: 'Name', border: OutlineInputBorder())),
               const SizedBox(height: 12),
               TextField(
                 controller: encKeyCtrl,
@@ -347,9 +346,8 @@ void _openQrScanner() {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
           FilledButton(
             onPressed: () async {
               final name = nameCtrl.text.trim();
@@ -393,9 +391,8 @@ void _openQrScanner() {
         content: Text('Remove ${contact.name}?'),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () => Navigator.pop(ctx, true),
@@ -404,10 +401,8 @@ void _openQrScanner() {
         ],
       ),
     );
-    if (confirm == true) await _removeContact(index);
+    if (confirm == true) await _confirmRemove(index);
   }
-
-  // ─── Fingerprint dialog ───────────────────────────────
 
   void _showFingerprintDialog(
       BuildContext context, ContactModel contact, ThemeData theme) {
@@ -421,11 +416,8 @@ void _openQrScanner() {
             Icon(Icons.verified_user, color: theme.colorScheme.primary),
             const SizedBox(width: 8),
             Expanded(
-              child: Text(
-                contact.name,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
+                child:
+                    Text(contact.name, overflow: TextOverflow.ellipsis)),
           ],
         ),
         content: Column(
@@ -453,8 +445,7 @@ void _openQrScanner() {
             ),
             const SizedBox(height: 12),
             Text(
-              'Ask ${contact.name} to read their fingerprint aloud '
-              'and verify it matches exactly.',
+              'Ask ${contact.name} to read their fingerprint aloud and verify it matches exactly.',
               style: theme.textTheme.bodySmall,
             ),
           ],
@@ -471,15 +462,13 @@ void _openQrScanner() {
             label: const Text('Copy'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Done'),
-          ),
+              onPressed: () => Navigator.pop(ctx), child: const Text('Done')),
         ],
       ),
     );
   }
 
-  // ─── Crypto actions ───────────────────────────────────
+  // ─── Crypto ───────────────────────────────────────────
 
   Future<void> _processText() async {
     final input = _inputController.text.trim();
@@ -493,7 +482,6 @@ void _openQrScanner() {
       setState(() => _errorMessage = 'Please enter a message');
       return;
     }
-
     if (_isEncrypt && _selectedContact == null) {
       setState(() => _errorMessage = 'Select a contact to encrypt for');
       return;
@@ -513,7 +501,7 @@ void _openQrScanner() {
           _selectedContact!.publicKey,
           signingPrivateKey,
         );
-        setState(() => _result = encrypted);
+        setState(() => _result = _encodeOutput(encrypted));
       } else {
         if (_selectedContact == null) {
           setState(() =>
@@ -525,8 +513,9 @@ void _openQrScanner() {
           setState(() => _errorMessage = 'No private key found. Reset keys.');
           return;
         }
+        final rawCipher = _decodeInput(input);
         final decryptResult = await CryptoService.decryptAndVerify(
-          input,
+          rawCipher,
           privateKey,
           _selectedContact!.signingPublicKey,
         );
@@ -537,6 +526,8 @@ void _openQrScanner() {
       }
     } on CryptoException catch (e) {
       setState(() => _errorMessage = e.message);
+    } on WordEncoderException catch (e) {
+      setState(() => _errorMessage = 'Decode error: ${e.message}');
     } catch (e) {
       setState(() => _errorMessage = 'Unexpected error: ${e.toString()}');
     } finally {
@@ -559,6 +550,7 @@ void _openQrScanner() {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // ── Identity card ─────────────────────────────
           Card(
             margin: EdgeInsets.zero,
             child: Padding(
@@ -587,11 +579,9 @@ void _openQrScanner() {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            'Fingerprint',
-                            style: theme.textTheme.labelSmall
-                                ?.copyWith(color: theme.colorScheme.outline),
-                          ),
+                          Text('Fingerprint',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                  color: theme.colorScheme.outline)),
                           const SizedBox(height: 4),
                           Text(
                             _user != null
@@ -605,11 +595,9 @@ void _openQrScanner() {
                             ),
                           ),
                           const SizedBox(height: 4),
-                          Text(
-                            'Long-press to copy',
-                            style: theme.textTheme.labelSmall
-                                ?.copyWith(color: theme.colorScheme.outline),
-                          ),
+                          Text('Long-press to copy',
+                              style: theme.textTheme.labelSmall?.copyWith(
+                                  color: theme.colorScheme.outline)),
                         ],
                       ),
                     ),
@@ -642,20 +630,19 @@ void _openQrScanner() {
 
           const SizedBox(height: 24),
 
+          // ── Mode ──────────────────────────────────────
           Text('Mode', style: theme.textTheme.labelLarge),
           const SizedBox(height: 6),
           SegmentedButton<bool>(
             segments: const [
               ButtonSegment(
-                value: true,
-                label: Text('Encrypt'),
-                icon: Icon(Icons.lock_outline),
-              ),
+                  value: true,
+                  label: Text('Encrypt'),
+                  icon: Icon(Icons.lock_outline)),
               ButtonSegment(
-                value: false,
-                label: Text('Decrypt'),
-                icon: Icon(Icons.lock_open_outlined),
-              ),
+                  value: false,
+                  label: Text('Decrypt'),
+                  icon: Icon(Icons.lock_open_outlined)),
             ],
             selected: {_isEncrypt},
             onSelectionChanged: (val) => setState(() {
@@ -665,11 +652,61 @@ void _openQrScanner() {
               _lastSigValid = null;
               _inputController.clear();
               _selectedContact = null;
+              _useBase64 = true;
             }),
           ),
 
           const SizedBox(height: 20),
 
+          // ── Output encoding ───────────────────────────
+          Text('Output encoding', style: theme.textTheme.labelLarge),
+          const SizedBox(height: 6),
+          SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'base64', label: Text('Base64')),
+              ButtonSegment(value: 'persian', label: Text('Persian')),
+              ButtonSegment(
+                  value: 'mixed', label: Text('Mixed')),
+            ],
+            selected: {
+              _useBase64
+                  ? 'base64'
+                  : (_tokenMode == TokenMode.persian ? 'persian' : 'mixed')
+            },
+            onSelectionChanged: (val) async {
+              final choice = val.first;
+              if (choice == 'base64') {
+                setState(() {
+                  _useBase64 = true;
+                  _result = '';
+                  _errorMessage = null;
+                });
+              } else {
+                final mode = choice == 'persian'
+                    ? TokenMode.persian
+                    : TokenMode.mixed;
+                await WordEncoderService.saveMode(mode);
+                setState(() {
+                  _useBase64 = false;
+                  _tokenMode = mode;
+                  _result = '';
+                  _errorMessage = null;
+                });
+              }
+            },
+          ),
+          if (!_isEncrypt) ...[
+            const SizedBox(height: 6),
+            Text(
+              'Must match encoding used by sender',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline),
+            ),
+          ],
+
+          const SizedBox(height: 20),
+
+          // ── Recipient / Sender ────────────────────────
           Text(
             _isEncrypt ? 'Recipient' : 'Sender (for signature verification)',
             style: theme.textTheme.labelLarge,
@@ -679,19 +716,19 @@ void _openQrScanner() {
             initialValue: _selectedContact,
             decoration: InputDecoration(
               border: const OutlineInputBorder(),
-              hintText:
-                  _isEncrypt ? 'Select recipient' : 'Select sender contact',
+              hintText: _isEncrypt
+                  ? 'Select recipient'
+                  : 'Select sender contact',
             ),
             items: _contacts
-                .map((c) => DropdownMenuItem(
-                      value: c,
-                      child: Text(c.name),
-                    ))
+                .map((c) =>
+                    DropdownMenuItem(value: c, child: Text(c.name)))
                 .toList(),
             onChanged: (val) => setState(() => _selectedContact = val),
           ),
           const SizedBox(height: 20),
 
+          // ── Input ─────────────────────────────────────
           Text('Input', style: theme.textTheme.labelLarge),
           const SizedBox(height: 6),
           TextField(
@@ -707,6 +744,7 @@ void _openQrScanner() {
 
           const SizedBox(height: 12),
 
+          // ── Action button ─────────────────────────────
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
@@ -716,13 +754,14 @@ void _openQrScanner() {
                       width: 16,
                       height: 16,
                       child: CircularProgressIndicator(
-                          strokeWidth: 2, color: Colors.white),
-                    )
+                          strokeWidth: 2, color: Colors.white))
                   : Icon(_isEncrypt ? Icons.lock : Icons.lock_open),
-              label: Text(_isEncrypt ? 'Encrypt & Sign' : 'Decrypt & Verify'),
+              label:
+                  Text(_isEncrypt ? 'Encrypt & Sign' : 'Decrypt & Verify'),
             ),
           ),
 
+          // ── Error ─────────────────────────────────────
           if (_errorMessage != null) ...[
             const SizedBox(height: 12),
             Container(
@@ -739,16 +778,15 @@ void _openQrScanner() {
                       color: Colors.red.shade700, size: 18),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      _errorMessage!,
-                      style: TextStyle(color: Colors.red.shade700),
-                    ),
-                  ),
+                      child: Text(_errorMessage!,
+                          style:
+                              TextStyle(color: Colors.red.shade700))),
                 ],
               ),
             ),
           ],
 
+          // ── Signature badge ───────────────────────────
           if (!_isEncrypt && _lastSigValid != null) ...[
             const SizedBox(height: 12),
             Container(
@@ -768,7 +806,9 @@ void _openQrScanner() {
               child: Row(
                 children: [
                   Icon(
-                    _lastSigValid! ? Icons.verified_user : Icons.warning_amber,
+                    _lastSigValid!
+                        ? Icons.verified_user
+                        : Icons.warning_amber,
                     color: _lastSigValid!
                         ? Colors.green.shade700
                         : Colors.orange.shade700,
@@ -793,6 +833,7 @@ void _openQrScanner() {
             ),
           ],
 
+          // ── Result ────────────────────────────────────
           if (_result.isNotEmpty) ...[
             const SizedBox(height: 20),
             Row(
@@ -800,10 +841,9 @@ void _openQrScanner() {
               children: [
                 Text('Result', style: theme.textTheme.labelLarge),
                 IconButton(
-                  onPressed: _copyResult,
-                  icon: const Icon(Icons.copy),
-                  tooltip: 'Copy',
-                ),
+                    onPressed: _copyResult,
+                    icon: const Icon(Icons.copy),
+                    tooltip: 'Copy'),
               ],
             ),
             const SizedBox(height: 6),
@@ -838,10 +878,8 @@ void _openQrScanner() {
             Icon(Icons.people_outline,
                 size: 64, color: theme.colorScheme.outline),
             const SizedBox(height: 12),
-            const Text(
-              'No contacts yet.\nTap + to add one.',
-              textAlign: TextAlign.center,
-            ),
+            const Text('No contacts yet.\nTap + to add one.',
+                textAlign: TextAlign.center),
           ],
         ),
       );
@@ -859,7 +897,6 @@ void _openQrScanner() {
             .take(2)
             .map((w) => w[0].toUpperCase())
             .join();
-
         final fingerprint = FingerprintService.compute(
             contact.publicKey, contact.signingPublicKey);
 
@@ -881,9 +918,8 @@ void _openQrScanner() {
                 content: Text('Remove ${contact.name}?'),
                 actions: [
                   TextButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    child: const Text('Cancel'),
-                  ),
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('Cancel')),
                   FilledButton(
                     style:
                         FilledButton.styleFrom(backgroundColor: Colors.red),
@@ -934,9 +970,7 @@ void _openQrScanner() {
 
   // ─── Share page ───────────────────────────────────────
 
-  Widget _buildSharePage() {
-    return ShareScreen(user: _user);
-  }
+  Widget _buildSharePage() => ShareScreen(user: _user);
 
   // ─── Build ────────────────────────────────────────────
 
@@ -946,8 +980,7 @@ void _openQrScanner() {
 
     if (_loading) {
       return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
-      );
+          body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
@@ -956,38 +989,34 @@ void _openQrScanner() {
           IconButton(
             icon: const Icon(Icons.security),
             onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const LockSettingsScreen()),
-            ),
+                context,
+                MaterialPageRoute(
+                    builder: (_) => const LockSettingsScreen())),
           ),
         ],
       ),
       bottomNavigationBar: NavigationBar(
-        onDestinationSelected: (i) => setState(() => currentPageIndex = i),
+        onDestinationSelected: (i) =>
+            setState(() => currentPageIndex = i),
         indicatorColor: Colors.amber,
         selectedIndex: currentPageIndex,
         destinations: const [
           NavigationDestination(
-            selectedIcon: Icon(Icons.home),
-            icon: Icon(Icons.home_outlined),
-            label: 'Home',
-          ),
+              selectedIcon: Icon(Icons.home),
+              icon: Icon(Icons.home_outlined),
+              label: 'Home'),
           NavigationDestination(
-            icon: Icon(Icons.contact_mail),
-            label: 'Contacts',
-          ),
+              icon: Icon(Icons.contact_mail), label: 'Contacts'),
           NavigationDestination(
-            selectedIcon: Icon(Icons.qr_code_2),
-            icon: Icon(Icons.qr_code_2_outlined),
-            label: 'Share',
-          ),
+              selectedIcon: Icon(Icons.qr_code_2),
+              icon: Icon(Icons.qr_code_2_outlined),
+              label: 'Share'),
         ],
       ),
       floatingActionButton: currentPageIndex == 1
           ? FloatingActionButton(
               onPressed: _openAddContactSheet,
-              child: const Icon(Icons.add),
-            )
+              child: const Icon(Icons.add))
           : null,
       body: IndexedStack(
         index: currentPageIndex,
@@ -1001,7 +1030,7 @@ void _openQrScanner() {
   }
 }
 
-// ─── QR Scanner page ──────────────────────────────────────
+// ─── QR Scanner ───────────────────────────────────────────
 
 class _QrScannerPage extends StatefulWidget {
   final void Function(ContactPayload) onDetected;
@@ -1036,9 +1065,8 @@ class _QrScannerPageState extends State<_QrScannerPage> {
 
     final payload = DeepLinkService.parseQr(raw);
     if (payload == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Invalid QR — not a Sealed contact link')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Invalid QR — not a Sealed contact link')));
       setState(() => _processing = false);
       _ctrl.start();
       return;
@@ -1060,9 +1088,7 @@ class _QrScannerPageState extends State<_QrScannerPage> {
               height: 220,
               decoration: BoxDecoration(
                 border: Border.all(
-                  color: theme.colorScheme.primary,
-                  width: 2,
-                ),
+                    color: theme.colorScheme.primary, width: 2),
                 borderRadius: BorderRadius.circular(12),
               ),
             ),
@@ -1071,8 +1097,8 @@ class _QrScannerPageState extends State<_QrScannerPage> {
             Container(
               color: Colors.black45,
               child: const Center(
-                child: CircularProgressIndicator(color: Colors.white),
-              ),
+                  child:
+                      CircularProgressIndicator(color: Colors.white)),
             ),
         ],
       ),
@@ -1080,12 +1106,11 @@ class _QrScannerPageState extends State<_QrScannerPage> {
   }
 }
 
-// ─── Key preview widget ──────────────────────────────────
+// ─── Key preview widget ───────────────────────────────────
 
 class _KeyPreview extends StatelessWidget {
   final String label;
   final String value;
-
   const _KeyPreview({required this.label, required this.value});
 
   @override
@@ -1098,12 +1123,11 @@ class _KeyPreview extends StatelessWidget {
             style: theme.textTheme.labelSmall
                 ?.copyWith(color: theme.colorScheme.outline)),
         const SizedBox(height: 2),
-        Text(
-          value,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
-        ),
+        Text(value,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall
+                ?.copyWith(fontFamily: 'monospace')),
       ],
     );
   }
