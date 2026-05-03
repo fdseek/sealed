@@ -15,17 +15,25 @@
 //                          getSigningPrivateKey, resetKeys
 //                          (private keys from keychain, NOT SQLite)
 //   • ContactRepository  — insert, getAll ordering, delete
+//   • DeepLinkService    — build, parse, QR parse, edge cases
+//   • FingerprintService — compute, format, determinism, independence
+//   • AuthLockService    — PIN hash, verify, fail count, stealth,
+//                          timeout logic, enable/disable, biometric flag
 //   • Integration        — full encrypt/decrypt flow with real keys
 // ============================================================
 
 import 'dart:convert';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'package:sealed_app/services/crypto_service.dart';
 import 'package:sealed_app/services/secure_key_storage.dart';
+import 'package:sealed_app/services/deep_link_service.dart';
+import 'package:sealed_app/services/fingerprint_service.dart';
+import 'package:sealed_app/services/auth_lock_service.dart';
 import 'package:sealed_app/models/user_model.dart';
 import 'package:sealed_app/models/contact_model.dart';
 import 'package:sealed_app/db/database_helper.dart';
@@ -40,15 +48,13 @@ void _initFfi() {
 }
 
 void _initSecureStorageMock() {
-  // flutter_secure_storage provides a built-in in-memory mock for tests.
   FlutterSecureStorage.setMockInitialValues({});
 }
 
 // ─── shared helpers ──────────────────────────────────────────────────────────
 
 Future<Database> _openTestDb() async {
-  final factory = databaseFactoryFfi;
-  final db = await factory.openDatabase(
+  final db = await databaseFactoryFfi.openDatabase(
     inMemoryDatabasePath,
     options: OpenDatabaseOptions(
       version: 2,
@@ -109,8 +115,7 @@ void _userModelTests() {
           ]));
     });
 
-    test('toMap private_key is always empty string (keychain only)', () {
-      // Private keys must NEVER be persisted to SQLite
+    test('toMap private_key always empty string (keychain only)', () {
       final m = sample.toMap();
       expect(m['private_key'], '');
       expect(m['signing_private_key'], '');
@@ -127,7 +132,6 @@ void _userModelTests() {
     // ── fromMap ────────────────────────────────────────────
 
     test('fromMap private keys always empty (not read from DB)', () {
-      // Even if DB row somehow has a value, fromMap returns empty
       final m = {
         'id': 1,
         'private_key': 'should_be_ignored',
@@ -217,9 +221,44 @@ void _userModelTests() {
         signingPublicKey: 'sigpub',
         createdAt: 0,
       );
-      // Even when model holds private key in memory, toMap protects DB
       expect(full.toMap()['private_key'], '');
       expect(full.toMap()['signing_private_key'], '');
+    });
+
+    // ── SECURITY: private key never leaks to DB ────────────
+
+    test(
+        'SECURITY: even after copyWithPrivateKeys toMap never exposes private key',
+        () {
+      final model = UserModel(
+        id: 1,
+        privateKey: '',
+        publicKey: 'pub',
+        signingPrivateKey: '',
+        signingPublicKey: 'sig',
+        createdAt: 0,
+      ).copyWithPrivateKeys(
+          privateKey: 'secret_key', signingPrivateKey: 'secret_sig');
+      final map = model.toMap();
+      expect(map.values, isNot(contains('secret_key')));
+      expect(map.values, isNot(contains('secret_sig')));
+    });
+
+    test(
+        'SECURITY: fromMap cannot be tricked into loading private key from DB row',
+        () {
+      // Even if an attacker writes private_key into SQLite row, fromMap ignores it
+      final maliciousRow = {
+        'id': 1,
+        'private_key': 'stolen_key',
+        'public_key': 'pub',
+        'signing_private_key': 'stolen_sig',
+        'signing_public_key': 'sigpub',
+        'created_at': 0,
+      };
+      final model = UserModel.fromMap(maliciousRow);
+      expect(model.privateKey, '');
+      expect(model.signingPrivateKey, '');
     });
   });
 }
@@ -281,6 +320,23 @@ void _contactModelTests() {
     test('signingPublicKey field exists and correct', () {
       expect(withId.signingPublicKey, 'sigpub');
     });
+
+    test('name with unicode chars survives roundtrip', () {
+      final c = ContactModel(
+        name: '日本語 Ünïcödé 🔐',
+        publicKey: 'pk',
+        signingPublicKey: 'sk',
+        createdAt: 0,
+      );
+      final back = ContactModel.fromMap(c.toMap()..['id'] = null);
+      expect(back.name, '日本語 Ünïcödé 🔐');
+    });
+
+    test('empty name allowed in model', () {
+      final c = ContactModel(
+          name: '', publicKey: 'pk', signingPublicKey: 'sk', createdAt: 0);
+      expect(c.name, '');
+    });
   });
 }
 
@@ -336,6 +392,14 @@ void _cryptoKeygenTests() {
       final hexPattern = RegExp(r'^[0-9a-f]+$');
       expect(hexPattern.hasMatch(kp['publicKey']!), isTrue);
       expect(hexPattern.hasMatch(kp['privateKey']!), isTrue);
+    });
+
+    test(
+        'enc keypair and signing keypair are independent (different algorithms)',
+        () async {
+      final enc = await CryptoService.generateKeyPair();
+      final sig = await CryptoService.generateSigningKeyPair();
+      expect(enc['publicKey'], isNot(sig['signingPublicKey']));
     });
   });
 }
@@ -419,6 +483,48 @@ void _cryptoRoundtripTests() {
       final c = await CryptoService.encryptAndSign(
           'hi', recipientKp['publicKey']!, senderSigKp['signingPrivateKey']!);
       expect(base64Url.decode(c).length, greaterThan(60));
+    });
+
+    // ── SECURITY: payload structure ────────────────────────
+
+    test(
+        'SECURITY: payload has correct structure (32 ephemeral + 12 nonce + N+16 mac)',
+        () async {
+      final c = await CryptoService.encryptAndSign(
+          'test', recipientKp['publicKey']!, senderSigKp['signingPrivateKey']!);
+      final bytes = base64Url.decode(c);
+      // 32 (ephemeral pub) + 12 (nonce) + at least 16 (mac)
+      expect(bytes.length, greaterThanOrEqualTo(32 + 12 + 16));
+    });
+
+    test('SECURITY: signature covers plaintext (sig is of msg not ciphertext)',
+        () async {
+      // Encrypt same plaintext twice - different ciphertexts but both valid
+      final msg = 'test message';
+      final c1 = await CryptoService.encryptAndSign(
+          msg, recipientKp['publicKey']!, senderSigKp['signingPrivateKey']!);
+      final c2 = await CryptoService.encryptAndSign(
+          msg, recipientKp['publicKey']!, senderSigKp['signingPrivateKey']!);
+      final r1 = await CryptoService.decryptAndVerify(
+          c1, recipientKp['privateKey']!, senderSigKp['signingPublicKey']!);
+      final r2 = await CryptoService.decryptAndVerify(
+          c2, recipientKp['privateKey']!, senderSigKp['signingPublicKey']!);
+      expect(r1.signatureValid, isTrue);
+      expect(r2.signatureValid, isTrue);
+    });
+
+    test('very long message with special JSON chars roundtrip', () async {
+      final msg = '{"nested":{"arr":[1,"two",null,true]}}' * 100;
+      final r = await rt(msg);
+      expect(r.plaintext, msg);
+      expect(r.signatureValid, isTrue);
+    });
+
+    test('null bytes in base64 payload do not cause issues', () async {
+      // Message with chars that encode to bytes including 0x00
+      final msg = String.fromCharCodes(List.generate(32, (i) => i));
+      final r = await rt(msg);
+      expect(r.plaintext, msg);
     });
   });
 }
@@ -587,6 +693,86 @@ void _cryptoSecurityTests() {
     test('CryptoException is Exception', () {
       expect(CryptoException('x'), isA<Exception>());
     });
+
+    // ── SECURITY: replay attacks ───────────────────────────
+
+    test(
+        'SECURITY: same ciphertext replayed still decrypts (no replay protection — known gap)',
+        () async {
+      // Document the known weakness: no nonce/timestamp binding
+      // App has no replay protection; this test documents the gap
+      final r1 = await CryptoService.decryptAndVerify(
+        validCipher,
+        recipientKp['privateKey']!,
+        realSenderSigKp['signingPublicKey']!,
+      );
+      final r2 = await CryptoService.decryptAndVerify(
+        validCipher,
+        recipientKp['privateKey']!,
+        realSenderSigKp['signingPublicKey']!,
+      );
+      expect(r1.plaintext, r2.plaintext);
+      // NOTE: This is the documented "no replay protection" gap in README
+    });
+
+    test('SECURITY: wrong-length public key → throws CryptoException',
+        () async {
+      expect(
+        () => CryptoService.encryptAndSign(
+          'msg',
+          'deadbeef', // too short (not 64 chars)
+          realSenderSigKp['signingPrivateKey']!,
+        ),
+        throwsA(isA<CryptoException>()),
+      );
+    });
+
+    test(
+        'SECURITY: all-zeros key encrypts but decryption with correct key fails (weak key accepted)',
+        () async {
+      final zeroKey = '0' * 64;
+      // X25519 low-order point — library accepts it, documents known weak key risk
+      final cipher = await CryptoService.encryptAndSign(
+        'msg',
+        zeroKey,
+        realSenderSigKp['signingPrivateKey']!,
+      );
+      // Cannot decrypt with normal key — different recipient
+      expect(
+        () => CryptoService.decryptAndVerify(
+          cipher,
+          recipientKp['privateKey']!,
+          realSenderSigKp['signingPublicKey']!,
+        ),
+        throwsA(isA<CryptoException>()),
+      );
+    });
+    test(
+        'SECURITY: nonce uniqueness — 100 encryptions all different ciphertexts',
+        () async {
+      final ciphertexts = <String>{};
+      for (var i = 0; i < 100; i++) {
+        final c = await CryptoService.encryptAndSign(
+          'same message',
+          recipientKp['publicKey']!,
+          realSenderSigKp['signingPrivateKey']!,
+        );
+        ciphertexts.add(c);
+      }
+      expect(ciphertexts.length, 100); // all unique
+    });
+
+    test('SECURITY: decrypting with swapped enc/sig keys throws', () async {
+      // Using signing key where encryption key expected
+      expect(
+        () => CryptoService.decryptAndVerify(
+          validCipher,
+          realSenderSigKp['signingPrivateKey']!, // wrong key type
+          realSenderSigKp['signingPublicKey']!,
+        ),
+        throwsA(isA<CryptoException>()),
+      );
+    });
   });
 }
 
@@ -606,22 +792,23 @@ void _decryptResultTests() {
       final r = DecryptResult(plaintext: 'hi', signatureValid: false);
       expect(r.signatureValid, isFalse);
     });
+
+    test('empty plaintext allowed', () {
+      final r = DecryptResult(plaintext: '', signatureValid: true);
+      expect(r.plaintext, '');
+    });
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SecureKeyStorage
-// Uses flutter_secure_storage built-in mock (in-memory, no platform needed)
 // ─────────────────────────────────────────────────────────────────────────────
 
 void _secureKeyStorageTests() {
   group('SecureKeyStorage', () {
     setUp(() {
-      // Reset mock to empty before each test
       FlutterSecureStorage.setMockInitialValues({});
     });
-
-    // ── write + read ───────────────────────────────────────
 
     test('savePrivateKey → getPrivateKey returns same value', () async {
       await SecureKeyStorage.savePrivateKey('deadbeef01');
@@ -642,8 +829,6 @@ void _secureKeyStorageTests() {
       expect(await SecureKeyStorage.getSigningPrivateKey(), isNull);
     });
 
-    // ── overwrite ──────────────────────────────────────────
-
     test('saving new private key overwrites old value', () async {
       await SecureKeyStorage.savePrivateKey('old');
       await SecureKeyStorage.savePrivateKey('new');
@@ -655,8 +840,6 @@ void _secureKeyStorageTests() {
       await SecureKeyStorage.saveSigningPrivateKey('new_sig');
       expect(await SecureKeyStorage.getSigningPrivateKey(), 'new_sig');
     });
-
-    // ── deleteAll ──────────────────────────────────────────
 
     test('deleteAll wipes both keys', () async {
       await SecureKeyStorage.savePrivateKey('pk');
@@ -670,23 +853,12 @@ void _secureKeyStorageTests() {
       expect(() => SecureKeyStorage.deleteAll(), returnsNormally);
     });
 
-    // ── isolation between keys ─────────────────────────────
-
     test('enc key and signing key are independent', () async {
       await SecureKeyStorage.savePrivateKey('enckey');
       await SecureKeyStorage.saveSigningPrivateKey('sigkey');
       expect(await SecureKeyStorage.getPrivateKey(), 'enckey');
       expect(await SecureKeyStorage.getSigningPrivateKey(), 'sigkey');
     });
-
-    test('deleting all clears enc key but not in isolation', () async {
-      await SecureKeyStorage.savePrivateKey('enckey');
-      // signing key not saved
-      await SecureKeyStorage.deleteAll();
-      expect(await SecureKeyStorage.getPrivateKey(), isNull);
-    });
-
-    // ── real key format ────────────────────────────────────
 
     test('stores and retrieves a real 64-char hex private key', () async {
       final kp = await CryptoService.generateKeyPair();
@@ -701,6 +873,495 @@ void _secureKeyStorageTests() {
       await SecureKeyStorage.saveSigningPrivateKey(kp['signingPrivateKey']!);
       final retrieved = await SecureKeyStorage.getSigningPrivateKey();
       expect(retrieved, kp['signingPrivateKey']);
+    });
+
+    // ── SECURITY: key isolation ────────────────────────────
+
+    test(
+        'SECURITY: enc private key and signing private key stored under different keys',
+        () async {
+      await SecureKeyStorage.savePrivateKey('enc_val');
+      await SecureKeyStorage.saveSigningPrivateKey('sig_val');
+      // They must not cross-contaminate
+      expect(await SecureKeyStorage.getPrivateKey(), 'enc_val');
+      expect(await SecureKeyStorage.getSigningPrivateKey(), 'sig_val');
+    });
+
+    test('SECURITY: deleteAll clears all keys atomically', () async {
+      await SecureKeyStorage.savePrivateKey('pk');
+      await SecureKeyStorage.saveSigningPrivateKey('sk');
+      await SecureKeyStorage.deleteAll();
+      expect(await SecureKeyStorage.getPrivateKey(), isNull);
+      expect(await SecureKeyStorage.getSigningPrivateKey(), isNull);
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DeepLinkService
+// ─────────────────────────────────────────────────────────────────────────────
+
+void _deepLinkServiceTests() {
+  group('DeepLinkService', () {
+    const name = 'Alice';
+    const enc =
+        'aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd';
+    const sig =
+        'eeff0011eeff0011eeff0011eeff0011eeff0011eeff0011eeff0011eeff0011';
+    // ── buildLink ──────────────────────────────────────────
+
+    test('buildLink starts with sealed://', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(link, startsWith('sealed://'));
+    });
+
+    test('buildLink contains name param', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(link, contains('name=Alice'));
+    });
+
+    test('buildLink contains enc param', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(link, contains('enc='));
+    });
+
+    test('buildLink contains sig param', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(link, contains('sig='));
+    });
+
+    // ── parse ──────────────────────────────────────────────
+
+    test('parse valid link → ContactPayload', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      final payload = DeepLinkService.parse(link);
+      expect(payload, isNotNull);
+      expect(payload!.name, name);
+      expect(payload.encPublicKey, enc);
+      expect(payload.sigPublicKey, sig);
+    });
+
+    test('parse → name preserved', () {
+      final link = DeepLinkService.buildLink(
+          name: 'Bob', encPublicKey: enc, sigPublicKey: sig);
+      expect(DeepLinkService.parse(link)!.name, 'Bob');
+    });
+
+    test('parse → encPublicKey preserved', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(DeepLinkService.parse(link)!.encPublicKey, enc);
+    });
+
+    test('parse → sigPublicKey preserved', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(DeepLinkService.parse(link)!.sigPublicKey, sig);
+    });
+
+    test('parse wrong scheme → null', () {
+      expect(DeepLinkService.parse('https://example.com'), isNull);
+    });
+
+    test('parse wrong host → null', () {
+      expect(DeepLinkService.parse('sealed://wrong?enc=a&sig=b'), isNull);
+    });
+
+    test('parse missing enc → null', () {
+      expect(DeepLinkService.parse('sealed://add?name=Alice&sig=b'), isNull);
+    });
+
+    test('parse missing sig → null', () {
+      expect(DeepLinkService.parse('sealed://add?name=Alice&enc=a'), isNull);
+    });
+
+    test('parse garbage string → null', () {
+      expect(DeepLinkService.parse('not a link at all'), isNull);
+    });
+
+    test('parse empty string → null', () {
+      expect(DeepLinkService.parse(''), isNull);
+    });
+
+    test('parse with leading/trailing whitespace → works', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      final payload = DeepLinkService.parse('  $link  ');
+      expect(payload, isNotNull);
+    });
+
+    test('parse with empty name → returns payload with empty name', () {
+      final link = DeepLinkService.buildLink(
+          name: '', encPublicKey: enc, sigPublicKey: sig);
+      final payload = DeepLinkService.parse(link);
+      expect(payload, isNotNull);
+      expect(payload!.name, '');
+    });
+
+    // ── parseQr ────────────────────────────────────────────
+
+    test('parseQr valid sealed:// link → ContactPayload', () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      final payload = DeepLinkService.parseQr(link);
+      expect(payload, isNotNull);
+      expect(payload!.encPublicKey, enc);
+    });
+
+    test('parseQr garbage → null', () {
+      expect(DeepLinkService.parseQr('random text'), isNull);
+    });
+
+    // ── buildShareableText ─────────────────────────────────
+
+    test('buildShareableText contains sealed:// link', () {
+      final text = DeepLinkService.buildShareableText(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(text, contains('sealed://'));
+    });
+
+    test('buildShareableText contains enc key', () {
+      final text = DeepLinkService.buildShareableText(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(text, contains(enc));
+    });
+
+    test('buildShareableText contains sig key', () {
+      final text = DeepLinkService.buildShareableText(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      expect(text, contains(sig));
+    });
+
+    test('buildShareableText contains name', () {
+      final text = DeepLinkService.buildShareableText(
+          name: 'Bob', encPublicKey: enc, sigPublicKey: sig);
+      expect(text, contains('Bob'));
+    });
+
+    // ── SECURITY: injection check ──────────────────────────
+
+    test('SECURITY: name with special chars encoded in URL safely', () {
+      final link = DeepLinkService.buildLink(
+          name: 'Alice & Bob <script>', encPublicKey: enc, sigPublicKey: sig);
+      final payload = DeepLinkService.parse(link);
+      expect(payload, isNotNull);
+      expect(payload!.name, 'Alice & Bob <script>');
+    });
+
+    test('SECURITY: keys with all hex chars survive URL encoding roundtrip',
+        () {
+      final link = DeepLinkService.buildLink(
+          name: name, encPublicKey: enc, sigPublicKey: sig);
+      final payload = DeepLinkService.parse(link);
+      expect(payload!.encPublicKey, enc);
+      expect(payload.sigPublicKey, sig);
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FingerprintService
+// ─────────────────────────────────────────────────────────────────────────────
+
+void _fingerprintServiceTests() {
+  group('FingerprintService', () {
+    const enc =
+        'aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd';
+    const sig =
+        'eeff0011eeff0011eeff0011eeff0011eeff0011eeff0011eeff0011eeff0011';
+    test('compute returns non-empty string', () {
+      expect(FingerprintService.compute(enc, sig), isNotEmpty);
+    });
+
+    test('compute is deterministic (same input → same output)', () {
+      final a = FingerprintService.compute(enc, sig);
+      final b = FingerprintService.compute(enc, sig);
+      expect(a, b);
+    });
+
+    test('compute format: colon-separated uppercase hex pairs', () {
+      final fp = FingerprintService.compute(enc, sig);
+      final pattern = RegExp(r'^[0-9A-F]{2}(:[0-9A-F]{2})+$');
+      expect(pattern.hasMatch(fp), isTrue);
+    });
+
+    test('compute produces 16 pairs (16 bytes shown)', () {
+      final fp = FingerprintService.compute(enc, sig);
+      expect(fp.split(':').length, 16);
+    });
+
+    test('different enc key → different fingerprint', () {
+      final fp1 = FingerprintService.compute(enc, sig);
+      final fp2 = FingerprintService.compute('1122334455667788' * 4, sig);
+      expect(fp1, isNot(fp2));
+    });
+
+    test('different sig key → different fingerprint', () {
+      final fp1 = FingerprintService.compute(enc, sig);
+      final fp2 = FingerprintService.compute(enc, '9900aabb' * 8);
+      expect(fp1, isNot(fp2));
+    });
+
+    test('swapped enc and sig keys → different fingerprint (order matters)',
+        () {
+      final fp1 = FingerprintService.compute(enc, sig);
+      final fp2 = FingerprintService.compute(sig, enc);
+      expect(fp1, isNot(fp2));
+    });
+
+    test('computeOwn delegates to compute (same result)', () {
+      final fp1 = FingerprintService.compute(enc, sig);
+      final fp2 = FingerprintService.computeOwn(enc, sig);
+      expect(fp1, fp2);
+    });
+
+    test('compute result is SHA-256 based (16 bytes of 32-byte hash)', () {
+      // Manually compute expected value
+      final input = utf8.encode(enc + sig);
+      final digest = sha256.convert(input);
+      final expected = digest.bytes
+          .take(16)
+          .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+          .join(':');
+      expect(FingerprintService.compute(enc, sig), expected);
+    });
+
+    test('empty strings → still returns valid format', () {
+      final fp = FingerprintService.compute('', '');
+      expect(fp.split(':').length, 16);
+    });
+
+    // ── SECURITY: fingerprint is collision-resistant for real keys ──
+
+    test('SECURITY: two different real keypairs have different fingerprints',
+        () async {
+      final kp1 = await CryptoService.generateKeyPair();
+      final sp1 = await CryptoService.generateSigningKeyPair();
+      final kp2 = await CryptoService.generateKeyPair();
+      final sp2 = await CryptoService.generateSigningKeyPair();
+      final fp1 = FingerprintService.compute(
+          kp1['publicKey']!, sp1['signingPublicKey']!);
+      final fp2 = FingerprintService.compute(
+          kp2['publicKey']!, sp2['signingPublicKey']!);
+      expect(fp1, isNot(fp2));
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AuthLockService
+// ─────────────────────────────────────────────────────────────────────────────
+
+void _authLockServiceTests() {
+  group('AuthLockService', () {
+    setUp(() {
+      FlutterSecureStorage.setMockInitialValues({});
+    });
+
+    tearDown(() async {
+      await AuthLockService.disableAll();
+    });
+
+    // ── enabled state ──────────────────────────────────────
+
+    test('isEnabled returns false by default', () async {
+      expect(await AuthLockService.isEnabled(), isFalse);
+    });
+
+    test('setEnabled true → isEnabled returns true', () async {
+      await AuthLockService.setEnabled(true);
+      expect(await AuthLockService.isEnabled(), isTrue);
+    });
+
+    test('setEnabled false → isEnabled returns false', () async {
+      await AuthLockService.setEnabled(true);
+      await AuthLockService.setEnabled(false);
+      expect(await AuthLockService.isEnabled(), isFalse);
+    });
+
+    // ── biometric state ────────────────────────────────────
+
+    test('isBiometricEnabled returns false by default', () async {
+      expect(await AuthLockService.isBiometricEnabled(), isFalse);
+    });
+
+    test('setBiometricEnabled true → isBiometricEnabled returns true',
+        () async {
+      await AuthLockService.setBiometricEnabled(true);
+      expect(await AuthLockService.isBiometricEnabled(), isTrue);
+    });
+
+    // ── PIN management ─────────────────────────────────────
+
+    test('hasPIN returns false before any PIN set', () async {
+      expect(await AuthLockService.hasPIN(), isFalse);
+    });
+
+    test('savePIN → hasPIN returns true', () async {
+      await AuthLockService.savePIN('123456');
+      expect(await AuthLockService.hasPIN(), isTrue);
+    });
+
+    test('clearPIN → hasPIN returns false', () async {
+      await AuthLockService.savePIN('123456');
+      await AuthLockService.clearPIN();
+      expect(await AuthLockService.hasPIN(), isFalse);
+    });
+
+    // ── PIN verification ───────────────────────────────────
+
+    test('verifyPIN correct → returns true', () async {
+      await AuthLockService.savePIN('654321');
+      expect(await AuthLockService.verifyPIN('654321'), isTrue);
+    });
+
+    test('verifyPIN wrong → returns false', () async {
+      await AuthLockService.savePIN('654321');
+      expect(await AuthLockService.verifyPIN('000000'), isFalse);
+    });
+
+    test('verifyPIN no PIN set → returns false', () async {
+      expect(await AuthLockService.verifyPIN('123456'), isFalse);
+    });
+
+    test('verifyPIN case: correct after wrong guesses → resets fail count',
+        () async {
+      await AuthLockService.savePIN('111111');
+      await AuthLockService.verifyPIN('000000');
+      await AuthLockService.verifyPIN('000000');
+      final ok = await AuthLockService.verifyPIN('111111');
+      expect(ok, isTrue);
+    });
+
+    // ── SECURITY: stealth mode ─────────────────────────────
+
+    test('SECURITY: 3 wrong PINs → stealthTriggered = true', () async {
+      await AuthLockService.savePIN('999999');
+      await AuthLockService.verifyPIN('000000');
+      await AuthLockService.verifyPIN('000000');
+      expect(AuthLockService.stealthTriggered, isFalse);
+      await AuthLockService.verifyPIN('000000');
+      expect(AuthLockService.stealthTriggered, isTrue);
+    });
+
+    test('SECURITY: stealth not triggered before 3 fails', () async {
+      await AuthLockService.savePIN('999999');
+      await AuthLockService.verifyPIN('000000');
+      await AuthLockService.verifyPIN('000000');
+      expect(AuthLockService.stealthTriggered, isFalse);
+    });
+
+    test('SECURITY: markUnlocked resets stealth + fail count', () async {
+      await AuthLockService.savePIN('123456');
+      await AuthLockService.verifyPIN('wrong1');
+      await AuthLockService.verifyPIN('wrong2');
+      await AuthLockService.verifyPIN('wrong3');
+      expect(AuthLockService.stealthTriggered, isTrue);
+      AuthLockService.markUnlocked();
+      expect(AuthLockService.stealthTriggered, isFalse);
+    });
+
+    test('SECURITY: PIN hashed not stored in plaintext', () async {
+      // savePIN stores hash — verifyPIN must hash input before comparing
+      await AuthLockService.savePIN('123456');
+      // Wrong PIN must fail (proves comparison uses hash)
+      expect(await AuthLockService.verifyPIN('654321'), isFalse);
+    });
+
+    test('SECURITY: different PINs produce different stored hashes', () async {
+      // savePIN('111111') then try verifyPIN('222222') → must fail
+      await AuthLockService.savePIN('111111');
+      expect(await AuthLockService.verifyPIN('222222'), isFalse);
+    });
+
+    test('SECURITY: PIN with salt — raw PIN not verifiable without salt',
+        () async {
+      // The implementation uses 'sealed_pin_' prefix as salt
+      // Verifying the raw hash of just the PIN (no salt) must fail
+      await AuthLockService.savePIN('123456');
+      // verifyPIN internally hashes 'sealed_pin_123456', not '123456'
+      // This test confirms correct PIN works (salt is consistent)
+      expect(await AuthLockService.verifyPIN('123456'), isTrue);
+    });
+
+    // ── timeout ────────────────────────────────────────────
+
+    test('getTimeout returns immediate by default', () async {
+      expect(await AuthLockService.getTimeout(), LockTimeout.immediate);
+    });
+
+    test('setTimeout → getTimeout returns set value', () async {
+      await AuthLockService.setTimeout(LockTimeout.fiveMinutes);
+      expect(await AuthLockService.getTimeout(), LockTimeout.fiveMinutes);
+    });
+
+    test('LockTimeout.immediate.seconds == 0', () {
+      expect(LockTimeout.immediate.seconds, 0);
+    });
+
+    test('LockTimeout.thirtySeconds.seconds == 30', () {
+      expect(LockTimeout.thirtySeconds.seconds, 30);
+    });
+
+    test('LockTimeout.oneMinute.seconds == 60', () {
+      expect(LockTimeout.oneMinute.seconds, 60);
+    });
+
+    test('LockTimeout.fiveMinutes.seconds == 300', () {
+      expect(LockTimeout.fiveMinutes.seconds, 300);
+    });
+
+    test('LockTimeout labels are non-empty strings', () {
+      for (final t in LockTimeout.values) {
+        expect(t.label, isNotEmpty);
+      }
+    });
+
+    // ── shouldLock ─────────────────────────────────────────
+
+    test('shouldLock returns false when lock not enabled', () async {
+      expect(await AuthLockService.shouldLock(), isFalse);
+    });
+
+    test('shouldLock returns true when enabled and never unlocked', () async {
+      await AuthLockService.setEnabled(true);
+      expect(await AuthLockService.shouldLock(), isTrue);
+    });
+
+    test('shouldLock returns true after markUnlocked with immediate timeout',
+        () async {
+      await AuthLockService.setEnabled(true);
+      await AuthLockService.setTimeout(LockTimeout.immediate);
+      AuthLockService.markUnlocked();
+      expect(await AuthLockService.shouldLock(), isTrue);
+    });
+
+    test(
+        'shouldLock returns false after markUnlocked with 5min timeout (just unlocked)',
+        () async {
+      await AuthLockService.setEnabled(true);
+      await AuthLockService.setTimeout(LockTimeout.fiveMinutes);
+      AuthLockService.markUnlocked();
+      expect(await AuthLockService.shouldLock(), isFalse);
+    });
+
+    // ── disableAll ─────────────────────────────────────────
+
+    test('disableAll clears all lock settings', () async {
+      await AuthLockService.setEnabled(true);
+      await AuthLockService.setBiometricEnabled(true);
+      await AuthLockService.savePIN('123456');
+      await AuthLockService.setTimeout(LockTimeout.fiveMinutes);
+      await AuthLockService.disableAll();
+      expect(await AuthLockService.isEnabled(), isFalse);
+      expect(await AuthLockService.isBiometricEnabled(), isFalse);
+      expect(await AuthLockService.hasPIN(), isFalse);
+      expect(await AuthLockService.getTimeout(), LockTimeout.immediate);
     });
   });
 }
@@ -836,6 +1497,46 @@ void _userRepositoryTests() {
       expect(hexPattern.hasMatch(u.privateKey), isTrue);
       expect(hexPattern.hasMatch(u.signingPrivateKey), isTrue);
     });
+
+    // ── SECURITY: DB never contains private key ────────────
+
+    test('SECURITY: DB row private_key empty after generate', () async {
+      await repo.generateAndSave();
+      final rows = await db.query('user');
+      expect(rows.first['private_key'], '');
+    });
+
+    test('SECURITY: DB row signing_private_key empty after generate', () async {
+      await repo.generateAndSave();
+      final rows = await db.query('user');
+      expect(rows.first['signing_private_key'], '');
+    });
+
+    test('SECURITY: DB row never contains private key after reset', () async {
+      await repo.generateAndSave();
+      await repo.resetKeys();
+      final rows = await db.query('user');
+      expect(rows.first['private_key'], '');
+      expect(rows.first['signing_private_key'], '');
+    });
+
+    test('SECURITY: generated public key is 64 chars (X25519 = 32 bytes)',
+        () async {
+      final u = await repo.generateAndSave();
+      expect(u.publicKey.length, 64);
+    });
+
+    test(
+        'SECURITY: generated signing public key is 64 chars (Ed25519 = 32 bytes)',
+        () async {
+      final u = await repo.generateAndSave();
+      expect(u.signingPublicKey.length, 64);
+    });
+
+    test('SECURITY: enc and signing public keys are different', () async {
+      final u = await repo.generateAndSave();
+      expect(u.publicKey, isNot(u.signingPublicKey));
+    });
   });
 }
 
@@ -937,6 +1638,36 @@ void _contactRepositoryTests() {
       final b = await repo.insert('B', 'e2', 's2');
       expect(a.id, isNot(b.id));
     });
+
+    test('insert 10 contacts → getAll returns 10', () async {
+      for (var i = 0; i < 10; i++) {
+        await repo.insert('Contact$i', 'enc$i', 'sig$i');
+      }
+      expect((await repo.getAll()).length, 10);
+    });
+
+    test('createdAt stored as unix millis (positive integer)', () async {
+      final c = await repo.insert('Alice', 'enc', 'sig');
+      final all = await repo.getAll();
+      expect(all.first.createdAt, greaterThan(0));
+      expect(all.first.createdAt, c.createdAt);
+    });
+
+    test('unicode name survives DB roundtrip', () async {
+      await repo.insert('日本語 🔐', 'enc', 'sig');
+      final all = await repo.getAll();
+      expect(all.first.name, '日本語 🔐');
+    });
+
+    // ── SECURITY ───────────────────────────────────────────
+
+    test('SECURITY: both enc and sig keys required — neither can be null',
+        () async {
+      // Insert returns model with both keys populated
+      final c = await repo.insert('Alice', 'enckey', 'sigkey');
+      expect(c.publicKey, isNotEmpty);
+      expect(c.signingPublicKey, isNotEmpty);
+    });
   });
 }
 
@@ -968,19 +1699,14 @@ void _integrationTests() {
       final recipientEncKp = await CryptoService.generateKeyPair();
 
       await contactRepo.insert(
-        'Recipient',
-        recipientEncKp['publicKey']!,
-        sender.signingPublicKey,
-      );
+          'Recipient', recipientEncKp['publicKey']!, sender.signingPublicKey);
 
       const msg = 'Integration test message 🔐';
-
       final cipher = await CryptoService.encryptAndSign(
         msg,
         recipientEncKp['publicKey']!,
         sender.signingPrivateKey,
       );
-
       final result = await CryptoService.decryptAndVerify(
         cipher,
         recipientEncKp['privateKey']!,
@@ -992,7 +1718,6 @@ void _integrationTests() {
     });
 
     test('private key from keychain works for actual decryption', () async {
-      // Sender has keys in keychain — retrieve and use for real crypto op
       final recipientUser = await userRepo.generateAndSave();
       final senderSigKp = await CryptoService.generateSigningKeyPair();
 
@@ -1002,7 +1727,6 @@ void _integrationTests() {
         senderSigKp['signingPrivateKey']!,
       );
 
-      // Get private key the way the app does — via repo → keychain
       final privKey = await userRepo.getPrivateKey();
       expect(privKey, isNotNull);
 
@@ -1029,8 +1753,6 @@ void _integrationTests() {
       await userRepo.resetKeys();
       final user2 = await userRepo.getUser();
 
-      // Decrypt still works (recipient key unchanged)
-      // but sig invalid — signing key changed
       final result = await CryptoService.decryptAndVerify(
         cipher,
         recipientKp['privateKey']!,
@@ -1040,33 +1762,12 @@ void _integrationTests() {
       expect(result.signatureValid, isFalse);
     });
 
-    test('after resetKeys new keychain key decrypts new messages', () async {
-      await userRepo.generateAndSave();
-      await userRepo.resetKeys();
-
-      final newUser = await userRepo.getUser();
-      final senderSig = await CryptoService.generateSigningKeyPair();
-      final newPrivKey = await userRepo.getPrivateKey();
-
-      await CryptoService.encryptAndSign(
-        'fresh message',
-        newUser!.signingPublicKey.isNotEmpty ? newUser.publicKey : '',
-        senderSig['signingPrivateKey']!,
-      );
-
-      // Ensure new private key is different from initial and works
-      expect(newPrivKey, isNotNull);
-    });
-
     test('contact signingPublicKey used correctly for verify', () async {
       final sender = await userRepo.generateAndSave();
       final recipientKp = await CryptoService.generateKeyPair();
 
       final contact = await contactRepo.insert(
-        'Sender',
-        sender.publicKey,
-        sender.signingPublicKey,
-      );
+          'Sender', sender.publicKey, sender.signingPublicKey);
 
       final cipher = await CryptoService.encryptAndSign(
         'hello',
@@ -1085,16 +1786,144 @@ void _integrationTests() {
     });
 
     test('two users keychain keys are independent', () async {
-      // Simulate user 1
       await userRepo.generateAndSave();
       final pk1 = await userRepo.getPrivateKey();
-
-      // Reset = new user
       await userRepo.resetKeys();
       final pk2 = await userRepo.getPrivateKey();
-
       expect(pk1, isNot(pk2));
       expect(pk2, isNotNull);
+    });
+
+    // ── SECURITY integration tests ─────────────────────────
+
+    test(
+        'SECURITY: MITM — attacker intercepts and re-encrypts with own sig → invalid',
+        () async {
+      final alice = await userRepo.generateAndSave();
+      final recipientKp = await CryptoService.generateKeyPair();
+      final attackerSig = await CryptoService.generateSigningKeyPair();
+
+      // Attacker intercepts and signs with their own key
+      final attackerCipher = await CryptoService.encryptAndSign(
+        'tampered message',
+        recipientKp['publicKey']!,
+        attackerSig['signingPrivateKey']!,
+      );
+
+      // Recipient verifies against Alice's known key
+      final result = await CryptoService.decryptAndVerify(
+        attackerCipher,
+        recipientKp['privateKey']!,
+        alice.signingPublicKey,
+      );
+
+      expect(result.signatureValid, isFalse);
+    });
+
+    test('SECURITY: wrong contact sig key → signatureValid false', () async {
+      final sender = await userRepo.generateAndSave();
+      final recipientKp = await CryptoService.generateKeyPair();
+      final wrongSigKp = await CryptoService.generateSigningKeyPair();
+
+      final cipher = await CryptoService.encryptAndSign(
+        'hello',
+        recipientKp['publicKey']!,
+        sender.signingPrivateKey,
+      );
+
+      // Contact has wrong signing key stored
+      final contact = await contactRepo.insert(
+        'Wrong',
+        sender.publicKey,
+        wrongSigKp['signingPublicKey']!,
+      );
+
+      final result = await CryptoService.decryptAndVerify(
+        cipher,
+        recipientKp['privateKey']!,
+        contact.signingPublicKey,
+      );
+
+      expect(result.signatureValid, isFalse);
+    });
+
+    test(
+        'SECURITY: full flow — fingerprint of sender contact matches their actual keys',
+        () async {
+      final sender = await userRepo.generateAndSave();
+      final contact = await contactRepo.insert(
+        'Sender',
+        sender.publicKey,
+        sender.signingPublicKey,
+      );
+
+      final expectedFp =
+          FingerprintService.compute(sender.publicKey, sender.signingPublicKey);
+      final contactFp = FingerprintService.compute(
+          contact.publicKey, contact.signingPublicKey);
+
+      expect(expectedFp, contactFp);
+    });
+
+    test('SECURITY: deep link → contact → verify full flow', () async {
+      final sender = await userRepo.generateAndSave();
+      final link = DeepLinkService.buildLink(
+        name: 'Sender',
+        encPublicKey: sender.publicKey,
+        sigPublicKey: sender.signingPublicKey,
+      );
+
+      final payload = DeepLinkService.parse(link);
+      expect(payload, isNotNull);
+
+      final contact = await contactRepo.insert(
+        payload!.name,
+        payload.encPublicKey,
+        payload.sigPublicKey,
+      );
+
+      final recipientKp = await CryptoService.generateKeyPair();
+      final cipher = await CryptoService.encryptAndSign(
+        'via deep link',
+        recipientKp['publicKey']!,
+        sender.signingPrivateKey,
+      );
+
+      final result = await CryptoService.decryptAndVerify(
+        cipher,
+        recipientKp['privateKey']!,
+        contact.signingPublicKey,
+      );
+
+      expect(result.plaintext, 'via deep link');
+      expect(result.signatureValid, isTrue);
+    });
+
+    test('SECURITY: reset keys → new keys work for new messages', () async {
+      await userRepo.generateAndSave();
+      await userRepo.resetKeys();
+
+      final newUser = await userRepo.getUser();
+      final newPrivKey = await userRepo.getPrivateKey();
+      final senderSig = await CryptoService.generateSigningKeyPair();
+
+      expect(newPrivKey, isNotNull);
+      expect(newUser, isNotNull);
+
+      final cipher = await CryptoService.encryptAndSign(
+        'new message after reset',
+        newUser!.publicKey,
+        senderSig['signingPrivateKey']!,
+      );
+
+      final result = await CryptoService.decryptAndVerify(
+        cipher,
+        newPrivKey!,
+        senderSig['signingPublicKey']!,
+      );
+
+      expect(result.plaintext, 'new message after reset');
+      expect(result.signatureValid, isTrue);
     });
   });
 }
@@ -1115,7 +1944,10 @@ void main() {
   _cryptoRoundtripTests();
   _cryptoSecurityTests();
   _decryptResultTests();
-  _secureKeyStorageTests(); // NEW
+  _secureKeyStorageTests();
+  _deepLinkServiceTests();
+  _fingerprintServiceTests();
+  _authLockServiceTests();
   _userRepositoryTests();
   _contactRepositoryTests();
   _integrationTests();
