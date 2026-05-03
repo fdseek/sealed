@@ -89,10 +89,21 @@ class _WordEncoderSettingsScreenState extends State<WordEncoderSettingsScreen> {
                 ),
                 child: Row(
                   children: [
-                    Radio<TokenMode>(
-                      value: m,
+                    RadioGroup<TokenMode>(
                       groupValue: _mode,
-                      onChanged: (v) => _setMode(v!),
+                      onChanged: (TokenMode? v) {
+                        if (v != null) _setMode(v);
+                      },
+                      child: Column(
+                        children: TokenMode.values.map((m) {
+                          return ListTile(
+                            title: Text(m.name),
+                            leading: Radio<TokenMode>(
+                              value: m,
+                            ),
+                          );
+                        }).toList(),
+                      ),
                     ),
                     const SizedBox(width: 8),
                     Expanded(
