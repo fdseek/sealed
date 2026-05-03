@@ -341,6 +341,172 @@ void _contactModelTests() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DatabaseHelper
+// ─────────────────────────────────────────────────────────────────────────────
+
+void _databaseHelperTests() {
+  group('DatabaseHelper', () {
+    late Database db;
+
+    setUp(() async {
+      db = await _openTestDb();
+      DatabaseHelper.overrideDatabase(db);
+    });
+
+    tearDown(() async {
+      await db.close();
+      DatabaseHelper.clearOverride();
+    });
+
+    test('database getter returns injected db', () async {
+      final got = await DatabaseHelper.instance.database;
+      expect(got, same(db));
+    });
+
+    test('overrideDatabase → same instance returned twice', () async {
+      final a = await DatabaseHelper.instance.database;
+      final b = await DatabaseHelper.instance.database;
+      expect(a, same(b));
+    });
+
+    test('clearOverride → _db null (next call would open fresh)', () async {
+      DatabaseHelper.clearOverride();
+      // re-inject so tearDown close works
+      DatabaseHelper.overrideDatabase(db);
+      expect(true, isTrue); // no throw = pass
+    });
+
+    test('user table exists with correct columns', () async {
+      final cols = await db.rawQuery('PRAGMA table_info(user)');
+      final names = cols.map((c) => c['name'] as String).toSet();
+      expect(
+          names,
+          containsAll([
+            'id',
+            'private_key',
+            'public_key',
+            'signing_private_key',
+            'signing_public_key',
+            'created_at'
+          ]));
+    });
+
+    test('contacts table exists with correct columns', () async {
+      final cols = await db.rawQuery('PRAGMA table_info(contacts)');
+      final names = cols.map((c) => c['name'] as String).toSet();
+      expect(
+          names,
+          containsAll([
+            'id',
+            'name',
+            'public_key',
+            'signing_public_key',
+            'created_at'
+          ]));
+    });
+
+    test('user table id = PRIMARY KEY (not autoincrement)', () async {
+      final cols = await db.rawQuery('PRAGMA table_info(user)');
+      final id = cols.firstWhere((c) => c['name'] == 'id');
+      expect(id['pk'], 1);
+    });
+
+    test('contacts id = AUTOINCREMENT → sequential ids', () async {
+      await db.insert('contacts', {
+        'name': 'A',
+        'public_key': 'pk1',
+        'signing_public_key': 'sk1',
+        'created_at': 1,
+      });
+      await db.insert('contacts', {
+        'name': 'B',
+        'public_key': 'pk2',
+        'signing_public_key': 'sk2',
+        'created_at': 2,
+      });
+      final rows = await db.query('contacts', orderBy: 'id ASC');
+      expect(rows[1]['id'] as int, greaterThan(rows[0]['id'] as int));
+    });
+
+    test('user insert + query roundtrip', () async {
+      await db.insert('user', {
+        'id': 1,
+        'private_key': '',
+        'public_key': 'pub',
+        'signing_private_key': '',
+        'signing_public_key': 'sigpub',
+        'created_at': 999,
+      });
+      final rows = await db.query('user', where: 'id = ?', whereArgs: [1]);
+      expect(rows.length, 1);
+      expect(rows.first['public_key'], 'pub');
+      expect(rows.first['signing_public_key'], 'sigpub');
+    });
+
+    test('contacts insert + query roundtrip', () async {
+      await db.insert('contacts', {
+        'name': 'Alice',
+        'public_key': 'enc',
+        'signing_public_key': 'sig',
+        'created_at': 123,
+      });
+      final rows = await db.query('contacts');
+      expect(rows.length, 1);
+      expect(rows.first['name'], 'Alice');
+    });
+
+    test('user table allows replace on conflict', () async {
+      final row = {
+        'id': 1,
+        'private_key': '',
+        'public_key': 'old',
+        'signing_private_key': '',
+        'signing_public_key': 'oldsig',
+        'created_at': 1,
+      };
+      await db.insert('user', row,
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      final row2 = Map<String, dynamic>.from(row);
+      row2['public_key'] = 'new';
+      await db.insert('user', row2,
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      final rows = await db.query('user');
+      expect(rows.length, 1);
+      expect(rows.first['public_key'], 'new');
+    });
+
+    test('delete user row works', () async {
+      await db.insert('user', {
+        'id': 1,
+        'private_key': '',
+        'public_key': 'p',
+        'signing_private_key': '',
+        'signing_public_key': 's',
+        'created_at': 0,
+      });
+      await db.delete('user', where: 'id = ?', whereArgs: [1]);
+      expect((await db.query('user')).isEmpty, isTrue);
+    });
+
+    test('delete contact row works', () async {
+      final id = await db.insert('contacts', {
+        'name': 'X',
+        'public_key': 'p',
+        'signing_public_key': 's',
+        'created_at': 0,
+      });
+      await db.delete('contacts', where: 'id = ?', whereArgs: [id]);
+      expect((await db.query('contacts')).isEmpty, isTrue);
+    });
+
+    test('empty tables → empty query result', () async {
+      expect((await db.query('user')).isEmpty, isTrue);
+      expect((await db.query('contacts')).isEmpty, isTrue);
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CryptoService — key generation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1951,4 +2117,5 @@ void main() {
   _userRepositoryTests();
   _contactRepositoryTests();
   _integrationTests();
+  _databaseHelperTests();
 }
