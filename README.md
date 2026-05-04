@@ -1,43 +1,23 @@
+# 🔐 Sealed
 
-# 🔐 Sealed — End-to-End Encrypted Messaging Toolkit
+> Offline-first, end-to-end encrypted messaging toolkit. No servers. No accounts. No metadata.
 
-> Encrypt messages. Verify senders. Trust no one in between.
-
----
-
-## Overview
-
-**Sealed** is a Flutter mobile/desktop application that provides **end-to-end encrypted and signed messaging** between trusted contacts — without relying on any server, cloud service, or third party.
-
-### The Problem
-
-Standard messaging apps store messages on servers, leaving them vulnerable to breaches, government requests, or insider access. Users needing true privacy — journalists, lawyers, activists — have no simple, offline-first tool to encrypt plaintext messages they can send through any channel they already use.
-
-### The Solution
-
-Sealed gives each user a locally generated key pair (X25519 for encryption, Ed25519 for signing). Users exchange public keys out-of-band, then encrypt/sign any message. The resulting blob can be sent via SMS, email, or a sticky note — transport layer is irrelevant. No server. No accounts. No metadata.
+Sealed lets two parties exchange cryptographically signed, encrypted messages over **any channel** — SMS, email, paper — using locally generated keys. Transport layer is irrelevant. Trust is cryptographic.
 
 ---
 
 ## Features
 
-### User-Facing
-- 🔑 Auto-generated key pair on first launch
-- 📋 Copy / Share public keys to exchange with contacts
-- 🔄 Encrypt & Sign messages for a selected contact
-- 🔓 Decrypt & Verify messages from a contact, with signature status badge
-- 👥 Contact management with both encryption and signing keys
-- ⚠️ Tamper detection — invalid messages flagged visually
-- 🔁 Key reset with confirmation dialog
-
-### Technical
-- **X25519** ephemeral key exchange — forward secrecy per message
-- **ChaCha20-Poly1305 AEAD** — authenticated symmetric encryption
-- **Ed25519** digital signatures — sender authentication, MITM protection
-- **SQLite** via `sqflite_common_ffi` — works on Android, iOS, Windows, Linux, macOS
-- **No network calls** — fully offline
-- Compact **base64url** binary payload
-- DB schema versioning with v1 → v2 migration
+- **X25519 key exchange** — ephemeral keypair per message → forward secrecy
+- **ChaCha20-Poly1305 AEAD** — authenticated encryption, tamper-evident
+- **Ed25519 signatures** — sender authentication inside the ciphertext (MITM-proof)
+- **Stealth lock mode** — 3 wrong PINs → app shows decoy "No messages" screen
+- **Biometric + PIN unlock** — `local_auth` gate on app open
+- **Private keys in keychain** — `flutter_secure_storage` (Keychain/Keystore), never SQLite
+- **QR code key exchange** — scan to add contact, no manual copy-paste required
+- **Key fingerprints** — SHA-256(encKey + sigKey) displayed per contact for out-of-band verification
+- **Fully offline** — zero network calls, zero backend
+- **Cross-platform** — Android, iOS, Linux, Windows (single codebase)
 
 ---
 
@@ -45,63 +25,109 @@ Sealed gives each user a locally generated key pair (X25519 for encryption, Ed25
 
 | Layer | Technology |
 |---|---|
-| Framework | Flutter (Dart) |
-| Cryptography | `package:cryptography` |
-| Local DB | `sqflite_common_ffi` |
-| Sharing | `share_plus` |
-| Utilities | `path`, `path_provider` |
-| Platforms | Android, iOS, Linux, Windows, macOS |
+| Framework | Flutter / Dart |
+| Encryption | `package:cryptography` — X25519, ChaCha20-Poly1305, Ed25519 |
+| Key Storage | `flutter_secure_storage` — platform Keychain / Keystore |
+| Database | `sqflite_common_ffi` — SQLite (public keys + contacts only) |
+| Auth | `local_auth` — biometric + PIN |
+| QR | `mobile_scanner` + `qr_flutter` |
+| Hashing | `package:crypto` — SHA-256 (PIN hash, fingerprints) |
+| CI/CD | GitHub Actions — test → build → release |
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-┌─────────────────────────────────┐
-│           UI Layer              │
-│  main.dart (StatefulWidget)     │
-│  - Home page (encrypt/decrypt)  │
-│  - Contacts page                │
-└────────────┬────────────────────┘
-             │
-    ┌────────▼────────┐
-    │  Repositories   │
-    │  UserRepository │  ←→  SQLite (user table)
-    │  ContactRepo    │  ←→  SQLite (contacts table)
-    └────────┬────────┘
-             │
-    ┌────────▼────────┐
-    │  CryptoService  │
-    │  X25519 + AEAD  │
-    │  Ed25519 sign   │
-    └─────────────────┘
-             │
-    ┌────────▼────────┐
-    │  DatabaseHelper │
-    │  SQLite FFI     │
-    └─────────────────┘
+┌──────────────────────────────────────────┐
+│                 UI Layer                 │
+│  main.dart — Home / Contacts / Share     │
+│  LockGate → LockScreen / PinSetupScreen  │
+└────────────────┬─────────────────────────┘
+                 │
+       ┌─────────▼──────────┐
+       │    Repositories     │
+       │  UserRepository     │──→ SQLite: public keys only
+       │  ContactRepository  │──→ SQLite: contacts (name, pubkeys)
+       └─────────┬───────────┘
+                 │
+       ┌─────────▼──────────┐
+       │   CryptoService    │
+       │  encryptAndSign()  │
+       │  decryptAndVerify()│
+       └─────────┬───────────┘
+                 │
+   ┌─────────────▼────────────────┐
+   │         Storage              │
+   │  SecureKeyStorage            │──→ Keychain/Keystore: private keys
+   │  DatabaseHelper (SQLite FFI) │──→ app.db (v2 schema)
+   └──────────────────────────────┘
 ```
 
-### Crypto Wire Format
+### Wire Format
 
 ```
 Payload (base64url):
-[ Ephemeral Pub 32B ][ Nonce 12B ][ Ciphertext + MAC 16B ]
+┌─────────────────┬──────────┬───────────────────────────┐
+│ Ephemeral Pub   │  Nonce   │ Ciphertext + Poly1305 MAC  │
+│    32 bytes     │ 12 bytes │      N + 16 bytes          │
+└─────────────────┴──────────┴───────────────────────────┘
 
 Inner plaintext (decrypted JSON):
-{ "msg": "<plaintext>", "sig": "<hex Ed25519 sig>" }
+{ "msg": "<plaintext>", "sig": "<hex Ed25519 signature>" }
 ```
+
+Signature covers the plaintext **before** encryption. Verification requires the sender's Ed25519 public key, stored per-contact. A wrong or missing key returns `signatureValid: false` — not an exception.
+
+### Key Separation
+
+| Key Type | Algorithm | Storage |
+|---|---|---|
+| Encryption private key | X25519 | `flutter_secure_storage` |
+| Signing private key | Ed25519 | `flutter_secure_storage` |
+| Encryption public key | X25519 | SQLite `user` table |
+| Signing public key | Ed25519 | SQLite `user` + `contacts` |
+
+Private keys **never** touch SQLite. `UserModel.toMap()` always writes empty strings for private key columns by design.
 
 ---
 
-## Installation Guide
+## Database Schema
+
+```sql
+-- v2 schema
+CREATE TABLE user (
+  id                  INTEGER PRIMARY KEY,
+  private_key         TEXT NOT NULL,          -- always '' (keychain only)
+  public_key          TEXT NOT NULL,
+  signing_private_key TEXT NOT NULL,          -- always '' (keychain only)
+  signing_public_key  TEXT NOT NULL,
+  created_at          INTEGER NOT NULL
+);
+
+CREATE TABLE contacts (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  name               TEXT NOT NULL,
+  public_key         TEXT NOT NULL,           -- X25519 enc pubkey
+  signing_public_key TEXT NOT NULL,           -- Ed25519 sig pubkey
+  created_at         INTEGER NOT NULL
+);
+```
+
+**Migration v1 → v2**: adds `signing_*` columns, then wipes the user row to force key regeneration on next launch.
+
+---
+
+## Installation
 
 ### Prerequisites
-- Flutter SDK ≥ 3.0 / Dart ≥ 3.0
-- Android SDK (API 21+) for Android builds
-- Xcode 14+ for iOS builds
 
-### Steps
+- Flutter SDK ≥ 3.19 / Dart ≥ 3.3
+- Android SDK API 21+ (Android builds)
+- Xcode 14+ (iOS builds)
+- Linux: `libsqlite3-dev libgtk-3-dev libsecret-1-dev`
+
+### Run
 
 ```bash
 git clone https://github.com/your-org/sealed.git
@@ -113,10 +139,18 @@ flutter run
 ### Release Builds
 
 ```bash
-flutter build apk --release               # Android APK
-flutter build appbundle --release          # Play Store
-flutter build ipa --release                # iOS
-flutter build linux --release              # Desktop
+# Android
+flutter build apk --release --split-per-abi
+flutter build appbundle --release
+
+# iOS
+flutter build ipa --release
+
+# Linux
+flutter build linux --release
+
+# Windows
+flutter build windows --release
 ```
 
 ---
@@ -124,98 +158,153 @@ flutter build linux --release              # Desktop
 ## Usage
 
 ### First Launch
-App auto-generates X25519 + Ed25519 key pair. Keys shown on Home tab.
+
+Key pair auto-generated on first run. X25519 + Ed25519 keypairs stored immediately — encryption key to Keychain/Keystore, public keys to SQLite.
 
 ### Share Your Keys
-Tap **Copy** or **Share**. Format:
+
+**Share tab** → enter display name → scan QR or copy link.
+
+Link format:
 ```
-enc:<X25519 public key hex>
-sig:<Ed25519 public key hex>
+sealed://add?name=Alice&enc=<X25519-hex>&sig=<Ed25519-hex>
 ```
 
 ### Add a Contact
-Contacts tab → **+** → enter name → paste their `enc:` and `sig:` keys → **Add**.
 
-### Encrypt
-Home → **Encrypt** mode → select recipient → type message → **Encrypt & Sign** → copy result.
+- **Scan QR** — camera scan of contact's QR
+- **Paste link** — paste `sealed://` link from clipboard
+- **Manual** — enter name + both public keys directly
 
-### Decrypt
-Home → **Decrypt** mode → select sender → paste blob → **Decrypt & Verify** → read plaintext + signature badge.
+### Encrypt a Message
+
+```
+Home → Encrypt mode → select recipient → type message → Encrypt & Sign
+```
+
+Output: base64url blob. Send via any channel.
+
+### Decrypt a Message
+
+```
+Home → Decrypt mode → select sender contact → paste blob → Decrypt & Verify
+```
+
+Result includes signature badge:
 
 | Badge | Meaning |
 |---|---|
-| ✅ Green | Authentic — signature matched contact's key |
-| ⚠️ Orange | INVALID — tampering, wrong sender, or key mismatch |
+| ✅ Green | Signature valid — message authentic |
+| ⚠️ Orange | Signature INVALID — tampered, wrong sender, or key mismatch |
+
+### Crypto API
+
+```dart
+// Encrypt for recipient, sign with sender's Ed25519 key
+final cipher = await CryptoService.encryptAndSign(
+  plaintext,
+  recipientPublicKeyHex,   // X25519 hex
+  signingPrivateKeyHex,    // Ed25519 hex
+);
+
+// Decrypt and verify sender signature
+final result = await CryptoService.decryptAndVerify(
+  ciphertext,              // base64url blob
+  privateKeyHex,           // X25519 hex
+  senderSigningPublicKeyHex,
+);
+
+result.plaintext       // String
+result.signatureValid  // bool
+```
+
+`CryptoException` thrown on: invalid base64, truncated payload, MAC failure, wrong key, missing fields.
+
+---
+
+## App Lock
+
+Configured in **Settings → App Lock**:
+
+| Option | Detail |
+|---|---|
+| PIN (6-digit) | SHA-256 hashed, stored in `flutter_secure_storage` |
+| Biometric | `local_auth` — fingerprint / Face ID |
+| Timeout | Immediate / 30s / 1min / 5min |
+| Stealth mode | 3 wrong PINs → decoy "No messages" screen |
+
+Lock state re-checked on every `AppLifecycleState.resumed` via `LockGate` (`WidgetsBindingObserver`).
 
 ---
 
 ## Configuration
 
-Zero-configuration by design. No env vars, no API keys.
+Zero configuration by design. No `.env`, no API keys, no backend.
 
-| Setting | Default | Note |
+| Setting | Value | Notes |
 |---|---|---|
-| DB version | 2 | Auto-migrated |
-| DB path | `getApplicationSupportDirectory()` | Platform app data dir |
-| Key storage | SQLite plaintext | ⚠️ Critical gap — see Production Review |
-
----
-
-## API Documentation
-
-No external API. Internal `CryptoService` API:
-
-```dart
-// Encrypt a message for a recipient, signed by sender
-static Future<String> encryptAndSign(
-  String plaintext,
-  String recipientPublicKeyHex,   // X25519
-  String signingPrivateKeyHex,    // Ed25519
-)
-
-// Decrypt and verify sender signature
-static Future<DecryptResult> decryptAndVerify(
-  String ciphertext,
-  String privateKeyHex,
-  String senderSigningPublicKeyHex,
-)
-
-class DecryptResult {
-  final String plaintext;
-  final bool signatureValid;
-}
-```
-
-`CryptoException` thrown on: invalid base64, corrupted payload, MAC failure, missing fields.
+| DB version | 2 | Auto-migrated on upgrade |
+| DB path | `getApplicationSupportDirectory()/app.db` | Platform app data dir |
+| Key storage | Platform Keychain/Keystore | Via `flutter_secure_storage` |
+| Network | None | Fully offline |
 
 ---
 
 ## Testing
 
 ```bash
-flutter test
+flutter test test/all_test.dart
+flutter test --coverage
 ```
 
-## Deployment
+Test coverage includes:
 
-### Android
-```bash
-flutter build appbundle --release
-```
-Requires `android/key.properties` with keystore signing config.
+- `UserModel` — `toMap`/`fromMap`, private key isolation, `copyWithPrivateKeys`
+- `ContactModel` — roundtrip, optional id
+- `CryptoService` — keygen, encrypt+sign, decrypt+verify, MITM/tamper/wrong-key scenarios
+- `SecureKeyStorage` — write/read/delete (in-memory mock)
+- `UserRepository` — full lifecycle with in-memory SQLite
+- `ContactRepository` — insert, ordering, delete
+- Integration — real crypto ops using repo-sourced keys
 
-### iOS
-```bash
-flutter build ipa --release
-```
-Requires Apple Developer account + provisioning profile.
+**Test isolation**: `DatabaseHelper.overrideDatabase()` injects in-memory SQLite. `FlutterSecureStorage.setMockInitialValues({})` resets keychain mock per test.
 
-### Desktop
-```bash
-flutter build linux --release
-flutter build windows --release
-flutter build macos --release
+CI enforces **60% minimum coverage** and runs `flutter analyze`.
+
+---
+
+## CI/CD
+
+GitHub Actions pipeline (`.github/workflows/dart.yml`):
+
 ```
+push/PR → test → build-android + build-linux + build-windows
+tag (v*) → release (upload APKs + AppImage + Windows zip)
+```
+
+Artifacts: split APKs, universal APK, Linux AppImage, Windows zip.
+
+---
+
+## Contributing
+
+1. Fork → `git checkout -b feature/your-feature`
+2. Crypto logic stays in `CryptoService` only — no crypto in UI
+3. **No network calls** — offline-first, always
+4. Tests required for all new logic; mandatory for anything touching crypto
+5. Never log or persist plaintext or private keys outside secure storage
+6. PR must describe security implications of the change
+7. Security-sensitive PRs require maintainer review before merge
+
+---
+
+## Known Limitations
+
+| Issue | Severity | Detail |
+|---|---|---|
+| Silent key wipe on DB upgrade | 🟠 High | v1→v2 migration deletes user row with no user notification |
+| No replay protection | 🟡 Medium | Ciphertexts can be replayed — no timestamp/session binding |
+| No message history | 🟡 Medium | Decrypt output not stored — copy before navigating away |
 
 ---
 
@@ -223,97 +312,14 @@ flutter build macos --release
 
 | Priority | Feature |
 |---|---|
+| 🔴 High | Notify user on DB migration key reset |
+| 🟡 Medium | Encrypted local message history |
 | 🟡 Medium | Multiple identities |
-| 🟡 Medium | Local encrypted message history |
-| 🟢 Low | Dark mode |
 | 🟢 Low | Localization / i18n |
-
----
-
-## Contributing Guidelines
-
-1. Fork → feature branch: `git checkout -b feature/your-feature`
-2. Keep all crypto logic in `CryptoService` — no crypto scattered in UI
-3. **No network calls** — offline-first, always
-4. Tests required for all new logic, mandatory for anything touching crypto
-5. Never log or persist plaintext messages or private keys outside secure storage
-6. PR must describe security implications of the change
-7. Security-sensitive PRs require maintainer review before merge
+| 🟢 Low | `SECURITY.md` + threat model doc |
 
 ---
 
 ## License
-[GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.en.html) .
 
-
-
-
-## 🏭 Production Readiness Review
-
-### ✅ What Is Done
-
-- [x] Correct algorithm choices: X25519, ChaCha20-Poly1305, Ed25519
-- [x] Ephemeral X25519 keypair per message — forward secrecy
-- [x] AEAD encryption — MAC authentication, tamper-evident
-- [x] Ed25519 signature inside ciphertext — MITM protection
-- [x] SQLite schema v2 with v1 → v2 migration
-- [x] Test-injectable `DatabaseHelper` (`overrideDatabase` / `clearOverride`)
-- [x] Both key types stored per contact
-- [x] Signature validity clearly surfaced in UI
-- [x] Key reset with confirmation dialog
-- [x] Cross-platform via `sqflite_common_ffi`
-- [x]  **Automated tests** — zero test files. No unit, widget, or integration tests.
-- [x] **License file**
-- [x] **Key input validation** — no length/format checks before crypto operations.
-- [x] **CI/CD pipeline**
-- [x] **Secure key storage** — private keys in plaintext SQLite. Must use `flutter_secure_storage` or platform keychain.
-
-- [x] **App authentication** — no PIN, biometric, or lock screen. Physical device access = full access.
-### ❌ What Is Missing
-
-
-- [ ] **DB migration UX** — `onUpgrade` silently deletes user row with no notification to the user.
-- [ ] **App store signing configuration** documented
-- [ ] **Privacy policy** — required for Play Store and App Store
-
-### ⚠️ Risks / Weak Points
-
-| Risk | Severity | Detail |
-|---|---|---|
-| Silent key wipe on DB upgrade | 🟠 High | v1 → v2 migration deletes user row silently |
-| No replay protection | 🟡 Medium | Captured ciphertexts can be replayed; no session/timestamp binding |
-
----
-
-## 📋 Release Checklist
-
-### Security (Blocking)
-- [x] Migrate private key storage to `flutter_secure_storage` or platform keychain
-- [ ] Add biometric / PIN authentication gate on app open
-- [x] Validate key lengths before crypto operations (64 hex chars for both key types)
-
-### Quality (Blocking)
-- [x] Unit tests: `CryptoService` (round-trip, tamper, wrong key, sig paths)
-- [x] Unit tests: `UserRepository`, `ContactRepository` with in-memory DB
-- [x] Widget tests: encrypt/decrypt UI flow
-- [x] Minimum 80% coverage on crypto + repository layers
-
-### UX / Correctness
-- [ ] Notify user when DB migration resets their keys
-- [x] Show key fingerprint per contact for out-of-band verification
-- [x] Add QR code key exchange
-- [x] Verify behavior on Android + iOS
-
-### Distribution
-- [ ] Add `LICENSE` file
-- [ ] Configure Android keystore in `android/key.properties`
-- [ ] Configure iOS signing
-- [ ] Write Privacy Policy
-- [ ] Create `CHANGELOG.md`
-- [x] Set up CI: `flutter test` + `flutter build` on push
-
-
-### Documentation
-- [ ] Add screenshots
-- [ ] Write threat model document
-- [ ] Add `SECURITY.md` with disclosure contact
+[GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.en.html)
